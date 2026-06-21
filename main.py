@@ -12,6 +12,7 @@
 
 import io
 import os
+import threading
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,10 +23,6 @@ from rembg import remove, new_session
 app = FastAPI(title="CreaBeaStudio Photo Tools")
 
 # ── CORS ────────────────────────────────────────────────────────────────
-# Locked to your own Next.js server's origin. Set ALLOWED_ORIGIN in
-# Render's environment variables (e.g. "https://creabeastudio.com").
-# Falls back to "*" only if unset, so local testing doesn't break —
-# tighten this before going live.
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 app.add_middleware(
     CORSMiddleware,
@@ -34,12 +31,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# rembg model session — created once at startup, reused across requests.
-# "isnet-general-use" is a good general-purpose model for photos of
-# people, pets, and objects. First request after a fresh deploy/cold
-# start will be slower while the model file downloads (~170MB) and loads
-# into memory; subsequent requests are fast.
-_session = new_session("isnet-general-use")
+# ── MODEL SESSION — lazy-loaded, not loaded at import time ──────────────
+# IMPORTANT: loading the model at module import time (before the server
+# can bind to its port) risks the process being killed for exceeding
+# memory on a constrained host (e.g. Render's free 512MB tier) before it
+# ever finishes starting — which looks like an infinite "waking up"
+# crash loop, since the platform just keeps restarting it at the same
+# point. Loading lazily on first request lets the server start
+# responding immediately; only the first real request pays the cost of
+# loading the model.
+#
+# "u2netp" is the deliberately lightweight model in this family (~4.7MB
+# vs ~170MB for isnet-general-use/u2net) — a much safer fit for a
+# 512MB-RAM host. Swap to a heavier model later if you upgrade to a
+# higher-memory paid tier and want better edge quality.
+MODEL_NAME = os.environ.get("BG_MODEL_NAME", "u2netp")
+
+_session = None
+_session_lock = threading.Lock()
+
+
+def get_session():
+    global _session
+    if _session is None:
+        with _session_lock:
+            if _session is None:  # re-check inside the lock
+                _session = new_session(MODEL_NAME)
+    return _session
 
 
 @app.get("/health")
@@ -61,7 +79,7 @@ async def remove_background(file: UploadFile = File(...)):
     input_bytes = await file.read()
 
     try:
-        output_bytes = remove(input_bytes, session=_session)
+        output_bytes = remove(input_bytes, session=get_session())
     except Exception as e:
         raise HTTPException(500, f"Background removal failed: {e}")
 
@@ -85,7 +103,7 @@ async def blur_background(file: UploadFile = File(...), blur_strength: int = 18)
         # rembg's cutout PNG has the subject with full alpha and the
         # background fully transparent — the alpha channel IS the mask
         # we need, no separate mask-only call required.
-        cutout_bytes = remove(input_bytes, session=_session)
+        cutout_bytes = remove(input_bytes, session=get_session())
         cutout = Image.open(io.BytesIO(cutout_bytes)).convert("RGBA")
         mask = cutout.split()[3]  # alpha channel = subject mask
 
